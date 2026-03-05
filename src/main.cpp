@@ -1,38 +1,45 @@
 #define DATA_PIN 2
 #define HALF_BIT_RECEIVED_PIN 4
-#define HALF_BIT_INTERVAL_US 418
+#define HALF_BIT_INTERVAL_US 419
 #define MAX_HALF_BITS 30
+#define PWM_IRQ_PIN 15  // any existing pin
 
 #define EC_MASK1 0b01111000
 #define EC_MASK2 0b11100110
 #define EC_MASK3 0b11010101
 #define EC_MASK4 0b10001011
 
+#define DRAWING_MODE_BYTE 27
+#define DRAWING_BLOCKS 4                 // LCD is 32 pixels height, and each block is 8 pixels (1 byte), so we need 4 blocks to represent the full height of the LCD
+#define MAX_DRAWING_BYTES_PER_BLOCK 166  // represents max line width of HP 82240A/B printer
+
 #define END_OF_TRANSMISSION_BYTE 4
 #define ASCII_OFFSET 128
 
 #include <Arduino.h>
-#include <RPi_Pico_TimerInterrupt.h>
+#include <hardware/pwm.h>
 
-constexpr char16_t ROMAN_8_SYMBOLS[18] = {
-    u'\u00a0',
-    u'\u00f7',
-    u'\u00d7',
-    u'\u221a',
-    u'\u222b',
-    u'\u03a3',
-    u'\u23f5',
-    u'\u03C0',
-    u'\u2202',
-    u'\u2264',
-    u'\u2265',
-    u'\u2260',
-    u'\u0251',
-    u'\u2192',
-    u'\u2190',
-    u'\u00B5',
-    u'\u000A',
-    u'\u00B0'};
+#include <bitset>
+
+const char* const ROMAN_8_SYMBOLS[18] = {
+    " ",  // return regular space instead of non-breaking space to avoid issues with displaying non-breaking space in some terminals
+    "÷",
+    "×",
+    "√",
+    "∫",
+    "Σ",
+    "▶",
+    "π",
+    "∂",
+    "≤",
+    "≥",
+    "≠",
+    "∝",
+    "→",
+    "←",
+    "µ",
+    "\n",
+    "°"};
 constexpr uint8_t errorCorrectionsMasks[4] = {EC_MASK1, EC_MASK2, EC_MASK3, EC_MASK4};
 constexpr struct {
     uint8_t startHalfBits = 3;
@@ -48,37 +55,23 @@ constexpr struct {
 volatile bool halfBitBuffer0[MAX_HALF_BITS];
 volatile bool halfBitBuffer1[MAX_HALF_BITS];
 volatile uint8_t activeBuffer = 0;
-volatile bool timerStarted = false;
+volatile bool pwmStarted = false;
 volatile bool dataReceivedInHalfBit = false;
 volatile bool byteReadyForProcessing = false;
-volatile bool halfBitPinState = LOW;
 
-RPI_PICO_Timer ITimer1(1);
+uint sliceNum;
 
-void __no_inline_not_in_flash_func(dataISR)() {
-    if (!timerStarted) {
-        ITimer1.enableTimer();
-        timerStarted = true;
+bool drawMode = false;
+bool readyToDrawBuffer = false;
+uint8_t drawingBuffer[MAX_DRAWING_BYTES_PER_BLOCK];
+uint8_t bytesToDrawInCurrentBlock = 0;
 
-        digitalWriteFast(HALF_BIT_RECEIVED_PIN, HIGH);  // Indicate half-bit received
-        halfBitPinState = HIGH;
-    }
-
-    dataReceivedInHalfBit = true;
-    byteReadyForProcessing = false;
-}
-
-void stopHalfBitTimer() {
-    ITimer1.stopTimer();
-    timerStarted = false;
-}
-
-bool halfBitTimerCallback(struct repeating_timer* t) {
-    (void)*t;  // Avoid unused parameter warning
+void __no_inline_not_in_flash_func(halfBitPWM_ISR)() {
     static uint_fast8_t halfBitBufferIndex = 0;
 
-    halfBitPinState = !halfBitPinState;                        // Toggle half-bit pin state
-    digitalWriteFast(HALF_BIT_RECEIVED_PIN, halfBitPinState);  // Reset half-bit received indicator
+    pwm_clear_irq(sliceNum);
+
+    digitalWriteFast(HALF_BIT_RECEIVED_PIN, !digitalReadFast(HALF_BIT_RECEIVED_PIN));  // Reset half-bit received indicator
 
     activeBuffer == 0 ? (halfBitBuffer0[halfBitBufferIndex] = dataReceivedInHalfBit)
                       : (halfBitBuffer1[halfBitBufferIndex] = dataReceivedInHalfBit);
@@ -89,12 +82,25 @@ bool halfBitTimerCallback(struct repeating_timer* t) {
     if (halfBitBufferIndex >= MAX_HALF_BITS) {
         halfBitBufferIndex = 0;
         byteReadyForProcessing = true;
-        activeBuffer = 1 - activeBuffer;  // Switch active buffer
+        activeBuffer = 1 - activeBuffer;
 
-        stopHalfBitTimer();  // Stop half-bit timer until next byte is received
+        sio_hw->gpio_clr = (1 << HALF_BIT_RECEIVED_PIN);  // Reset half-bit received indicator
+        pwm_set_enabled(sliceNum, false);                 // Stop the PWM timer until the next byte is received
+        pwmStarted = false;
+    }
+}
+
+void __no_inline_not_in_flash_func(dataISR)(uint gpio, uint32_t events) {
+    if (!pwmStarted) {
+        pwm_set_counter(sliceNum, 0);  // Reset the timer counter to ensure accurate timing for the first half-bit
+        pwm_set_enabled(sliceNum, true);
+        pwmStarted = true;
+
+        sio_hw->gpio_set = (1 << HALF_BIT_RECEIVED_PIN);  // Indicate half-bit received
     }
 
-    return true;  // Return true to keep the timer running
+    dataReceivedInHalfBit = true;
+    byteReadyForProcessing = false;
 }
 
 uint_fast8_t checkBit(const bool firstHalfBit, const bool secondHalfBit) {
@@ -108,69 +114,47 @@ uint_fast8_t checkBit(const bool firstHalfBit, const bool secondHalfBit) {
 }
 
 bool validateStartHalfBits(const bool* buffer) {
-    uint_fast8_t startHalfBitsValue = 0;  // Static variable to hold the calculated start half-bits value
-    Serial.print("First 3 half-bits: ");
     for (uint8_t i = protocolConfig.startHalfBitsOffset; i < protocolConfig.startHalfBits; i++) {
         uint8_t bitPosition = protocolConfig.startHalfBits - 1 - i;
-        startHalfBitsValue |= (buffer[i] << bitPosition);  // Shift and combine bits into a value
-
-        Serial.print(buffer[i] ? "1" : "0");
+        if (!buffer[i]) return false;  // Start half-bits should be all 1s, if not, it's an error
     }
-    Serial.println();
 
-    return startHalfBitsValue == 0b111;  // Check if the start half-bits match the expected pattern (0b111)
+    return true;
 }
 
 bool validateStopHalfBits(const bool* buffer) {
     for (uint8_t i = protocolConfig.stopHalfBitsOffset; i < MAX_HALF_BITS; i++) {
-        if (buffer[i] != 0) {
-            Serial.print("Invalid stop half-bits detected. Discarding byte. Position: ");
-            Serial.println(i);
-            return false;  // Stop half-bits should be all 0s, if not, it's an error
-        }
+        if (buffer[i]) return false;  // Stop half-bits should be all 0s, if not, it's an error
     }
 
-    return true;  // Stop half-bits are valid if all are 0s
-}
-
-void printErrorCheckingHalfBits(const bool* buffer) {
-    Serial.print("Error cheking half-bits: ");
-    for (uint8_t i = protocolConfig.errorCheckingBitsOffset; i < protocolConfig.dataBitsOffset; i++) {
-        Serial.print(buffer[i] ? "1" : "0");
-    }
-    Serial.println();
+    return true;
 }
 
 uint_fast8_t extractErrorCorrectionBits(const bool* buffer) {
     uint_fast8_t errorCorrectionBits = 0;  // Reset error correction variable before calculating
 
-    Serial.print("Error checking bits: ");
     for (uint8_t i = protocolConfig.errorCheckingBitsOffset; i < protocolConfig.dataBitsOffset; i += 2) {
         uint_fast8_t bitValue = checkBit(buffer[i], buffer[i + 1]);
 
         if (bitValue == 255) {
             Serial.println("Error correction bit error detected. Discarding value.");
-            printErrorCheckingHalfBits(buffer);
             return 255;  // Return 255 to indicate an error in error correction bits
         }
-
-        Serial.print(bitValue);
 
         uint8_t bitPosition = (i - 3) / 2;                       // Calculate bit position for error correction
         errorCorrectionBits |= (bitValue << (3 - bitPosition));  // Shift and combine bits into errorCorrection variable
     }
 
-    Serial.println();
-    Serial.print("Calculated error correction value: 0b");
+    Serial.print("Error correction value: 0b");
     Serial.println(errorCorrectionBits, BIN);
 
     return errorCorrectionBits;
 }
 
-uint_fast8_t calculateErrorCorrection(char data) {
+uint_fast8_t calculateErrorCorrection(uint_fast8_t data) {
     uint_fast8_t errorCorrectionBits = 0;
     for (uint8_t i = 0; i < 4; i++) {
-        uint8_t masked = errorCorrectionsMasks[i] & data;
+        uint_fast8_t masked = errorCorrectionsMasks[i] & data;
         uint8_t ones = __builtin_popcount(masked);
         if (ones % 2 != 0) {
             errorCorrectionBits |= (1 << (3 - i));  // Set the corresponding error correction bit if the count of ones is odd
@@ -183,47 +167,104 @@ uint_fast8_t calculateErrorCorrection(char data) {
     return errorCorrectionBits;
 }
 
-void printDataHalfBits(const bool* buffer) {
-    Serial.print("Data half-bits: ");
-    for (uint8_t i = 11; i < 27; i++) {
-        Serial.print(buffer[i] ? "1" : "0");
-    }
-    Serial.println();
-}
-
 uint_fast8_t extractDataByte(const bool* buffer) {
     uint_fast8_t dataByte = 0;
 
-    Serial.print("Data bits: ");
     for (uint8_t i = protocolConfig.dataBitsOffset; i < protocolConfig.stopHalfBitsOffset; i += 2) {
         uint_fast8_t bitValue = checkBit(buffer[i], buffer[i + 1]);
 
         if (bitValue == 255) {
             Serial.println("Data bit error detected, discarding byte.");
-            printDataHalfBits(buffer);
-
             return 255;  // Return 255 to indicate an error in data bits
         }
-
-        Serial.print(bitValue);
 
         uint8_t bitPosition = (i - 11) / 2;           // Calculate bit position for data bits
         dataByte |= (bitValue << (7 - bitPosition));  // Shift and combine bits into a byte
     }
 
-    Serial.println();
     Serial.print("Decoded byte: 0b");
     Serial.println(dataByte, BIN);
 
-    if (dataByte >= ASCII_OFFSET) {
+    if (drawMode) {
+        return dataByte;  // If we are in drawing mode, we will return the raw byte value for processing as drawing data, without interpreting it as ASCII or Roman symbols, since the drawing data can contain any byte value and is not meant to be interpreted as text.
+    }
+
+    if (dataByte >= ASCII_OFFSET + 18) {
+        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS. Discarding byte.");
+    } else if (dataByte >= ASCII_OFFSET && dataByte < ASCII_OFFSET + 18) {
         Serial.print("Decoded byte (roman symbol): ");
         Serial.println(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);
     } else {
         Serial.print("Decoded byte (ascii): ");
-        Serial.println(dataByte);
+        Serial.println((char)dataByte);
     }
 
     return dataByte;
+}
+
+void printDataByte(uint_fast8_t dataByte) {
+    if (dataByte >= ASCII_OFFSET + 18) {
+        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS. Discarding byte.");
+    } else if (dataByte >= ASCII_OFFSET) {
+        Serial1.print(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);  // Send the decoded Roman symbol over Serial1 (UART)
+    } else {
+        Serial1.print((char)dataByte);  // Send the decoded byte over Serial1 (UART)
+    }
+}
+
+void disableDrawingMode() {
+    if (drawMode) {
+        Serial.println("Drawing mode OFF");   // Send drawing mode status over Serial (USB)
+        Serial1.println("Drawing mode OFF");  // Send drawing mode status over Serial1 (
+    }
+    drawMode = false;
+}
+
+void enableDrawingMode() {
+    if (!drawMode) {
+        Serial.println("Drawing mode ON");   // Send drawing mode status over Serial (USB)
+        Serial1.println("Drawing mode ON");  // Send drawing mode status over Serial1 (UART)
+    }
+    drawMode = true;
+}
+
+void sendDrawBufferToUART() {
+    if (readyToDrawBuffer) {
+        uint8_t buffer[bytesToDrawInCurrentBlock + 1];  // +1 for null terminator
+
+        for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
+            for (uint8_t index = 0; index < bytesToDrawInCurrentBlock; index++) {
+                buffer[index] = ((drawingBuffer[index] >> bitIndex) & 1) ? '.' : ' ';
+            }
+            buffer[bytesToDrawInCurrentBlock] = '\n';                           // Null-terminate the buffer to safely print as a string
+            Serial.println("Sending drawing buffer to UART:");                  // Log the action of sending the drawing buffer
+            uart_write_blocking(uart0, buffer, bytesToDrawInCurrentBlock + 1);  // Send each byte of the drawing buffer over Serial1 (UART)
+        }
+    }
+}
+
+void processDrawingByte(uint_fast8_t dataByte) {
+    static uint8_t drawingBlock = 0;
+    static uint8_t drawingByteNumber = 0;
+
+    if (bytesToDrawInCurrentBlock == 0) {
+        bytesToDrawInCurrentBlock = dataByte;
+        Serial.print("Receiver will wait ");
+        Serial.print(bytesToDrawInCurrentBlock);
+        Serial.println(" bytes of drawing data for the next block of LCD (8 lines).");
+        return;
+    }
+
+    Serial.print("Drawing byte number: ");
+    Serial.println(drawingByteNumber);
+
+    drawingBuffer[drawingByteNumber++] = dataByte;
+
+    if (drawingByteNumber == bytesToDrawInCurrentBlock) {
+        readyToDrawBuffer = true;
+        drawingByteNumber = 0;
+        Serial.println("Ready to draw buffer.");
+    }
 }
 
 void processReceivedByte(uint8_t bufferToRead) {
@@ -238,28 +279,35 @@ void processReceivedByte(uint8_t bufferToRead) {
     }
 
     if (!stopHalfBitsValid) {
-        Serial.println("Invalid stop half-bits. Discarding byte.");
-        // return;
+        Serial.println("Invalid stop half-bits. Just ignore it.");
     }
 
-    uint_fast8_t errorCorrectionBits = extractErrorCorrectionBits(buffer);  // only 4 bits used for error correction, so uint_fast8_t is sufficient
+    uint_fast8_t errorCorrectionBits = extractErrorCorrectionBits(buffer);  // only 4 bits used
     uint_fast8_t dataByte = extractDataByte(buffer);
     uint_fast8_t calculateErrorCorrectionBits = calculateErrorCorrection(dataByte);  // Check error correction for the decoded byte;
 
     if (errorCorrectionBits != -1 && errorCorrectionBits != calculateErrorCorrectionBits) {
         // TODO: In case of error correction mismatch, we could attempt to correct the data by flipping bits and checking if the error correction matches. For now, we will just discard the byte if there is an error correction mismatch.
-        Serial.println("Error correction mismatch detected. Discarding byte.");
+        Serial.println("Error correction mismatch detected. Ignoring for now.");
+    }
+
+    switch (dataByte) {
+        case END_OF_TRANSMISSION_BYTE:
+            Serial1.println();  // Send a newline to indicate end of transmission
+            break;
+        case DRAWING_MODE_BYTE:
+            enableDrawingMode();  // Enable drawing mode and pass the previous data byte for context
+            break;
+        default:
+            if (drawMode) {
+                processDrawingByte(dataByte);
+            } else {
+                printDataByte(dataByte);
+            }
+            break;
     }
 
     Serial.println("--------------------------------");
-
-    if (dataByte == END_OF_TRANSMISSION_BYTE) {
-        Serial1.println();  // Send a newline to indicate end of transmission
-    } else if (dataByte >= ASCII_OFFSET) {
-        Serial1.print(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);  // Send the decoded Roman symbol over Serial1 (UART)
-    } else {
-        Serial1.print(dataByte);  // Send the decoded byte over Serial1 (UART)
-    }
 }
 
 void setup() {
@@ -271,23 +319,34 @@ void setup() {
 
     digitalWriteFast(HALF_BIT_RECEIVED_PIN, LOW);
 
-    attachInterrupt(digitalPinToInterrupt(DATA_PIN), dataISR, FALLING);
+    gpio_set_irq_enabled_with_callback(DATA_PIN, GPIO_IRQ_EDGE_FALL, true, &dataISR);
 
-    if (ITimer1.attachInterruptInterval(HALF_BIT_INTERVAL_US, halfBitTimerCallback)) {
-        Serial.print(F("Starting ITimer1 OK, millis() = "));
-        Serial.println(millis());
-        ITimer1.stopTimer();  // Start with the timer stopped until the first half-bit is received
-    } else {
-        Serial.println(F("Can't set ITimer1. Select another freq. or timer"));
-    }
+    sliceNum = pwm_gpio_to_slice_num(PWM_IRQ_PIN);
+    pwm_clear_irq(sliceNum);              // Clear any pending PWM interrupts
+    pwm_set_irq_enabled(sliceNum, true);  // Enable PWM interrupt for the selected slice
+
+    irq_set_exclusive_handler(PWM_IRQ_WRAP, halfBitPWM_ISR);  // Set the PWM interrupt handler for the selected slice
+    irq_set_enabled(PWM_IRQ_WRAP, true);                      // Enable the PWM interrupt
+
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv_int(&config, 133);                 // Set clock divider to achieve 1 MHz PWM frequency (assuming 133 MHz system clock)
+    pwm_config_set_wrap(&config, HALF_BIT_INTERVAL_US - 1);  // Set wrap value for the desired half-bit interval
+    pwm_init(sliceNum, &config, false);
 }
 
 void loop() {
     if (byteReadyForProcessing) {
         byteReadyForProcessing = false;  // Reset the flag to prevent re-processing the same byte
 
-        digitalWriteFast(HALF_BIT_RECEIVED_PIN, LOW);
         uint8_t bufferToRead = 1 - activeBuffer;
         processReceivedByte(bufferToRead);
+    }
+
+    if (readyToDrawBuffer) {
+        sendDrawBufferToUART();
+
+        readyToDrawBuffer = false;
+        bytesToDrawInCurrentBlock = 0;
+        Serial.println("Finished drawing block.");
     }
 }
