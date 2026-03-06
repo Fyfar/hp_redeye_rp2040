@@ -63,6 +63,8 @@ uint sliceNum;
 
 bool drawMode = false;
 bool readyToDrawBuffer = false;
+uint8_t drawingBlock = 0;
+bool terminationByteReceived = false;
 uint8_t drawingBuffer[MAX_DRAWING_BYTES_PER_BLOCK];
 uint8_t bytesToDrawInCurrentBlock = 0;
 
@@ -161,9 +163,6 @@ uint_fast8_t calculateErrorCorrection(uint_fast8_t data) {
         }
     }
 
-    Serial.print("Calculated error correction bits: 0b");
-    Serial.println(errorCorrectionBits, BIN);
-
     return errorCorrectionBits;
 }
 
@@ -173,10 +172,7 @@ uint_fast8_t extractDataByte(const bool* buffer) {
     for (uint8_t i = protocolConfig.dataBitsOffset; i < protocolConfig.stopHalfBitsOffset; i += 2) {
         uint_fast8_t bitValue = checkBit(buffer[i], buffer[i + 1]);
 
-        if (bitValue == 255) {
-            Serial.println("Data bit error detected, discarding byte.");
-            return 255;  // Return 255 to indicate an error in data bits
-        }
+        if (bitValue == 255) return 255;  // Return 255 to indicate an error in data bits
 
         uint8_t bitPosition = (i - 11) / 2;           // Calculate bit position for data bits
         dataByte |= (bitValue << (7 - bitPosition));  // Shift and combine bits into a byte
@@ -190,7 +186,7 @@ uint_fast8_t extractDataByte(const bool* buffer) {
     }
 
     if (dataByte >= ASCII_OFFSET + 18) {
-        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS. Discarding byte.");
+        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS.");
     } else if (dataByte >= ASCII_OFFSET && dataByte < ASCII_OFFSET + 18) {
         Serial.print("Decoded byte (roman symbol): ");
         Serial.println(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);
@@ -202,9 +198,9 @@ uint_fast8_t extractDataByte(const bool* buffer) {
     return dataByte;
 }
 
-void printDataByte(uint_fast8_t dataByte) {
+void sendSymbolDataByte(uint_fast8_t dataByte) {
     if (dataByte >= ASCII_OFFSET + 18) {
-        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS. Discarding byte.");
+        Serial1.print("?");  // Send a placeholder character for out-of-bounds values over Serial1 (UART)
     } else if (dataByte >= ASCII_OFFSET) {
         Serial1.print(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);  // Send the decoded Roman symbol over Serial1 (UART)
     } else {
@@ -214,8 +210,8 @@ void printDataByte(uint_fast8_t dataByte) {
 
 void disableDrawingMode() {
     if (drawMode) {
-        Serial.println("Drawing mode OFF");   // Send drawing mode status over Serial (USB)
-        Serial1.println("Drawing mode OFF");  // Send drawing mode status over Serial1 (
+        Serial.println("Drawing mode OFF");  // Send drawing mode status over Serial (USB)
+        Serial1.println(DRAWING_MODE_BYTE);  // Send drawing mode status over Serial1 (
     }
     drawMode = false;
 }
@@ -223,31 +219,32 @@ void disableDrawingMode() {
 void enableDrawingMode() {
     if (!drawMode) {
         Serial.println("Drawing mode ON");   // Send drawing mode status over Serial (USB)
-        Serial1.println("Drawing mode ON");  // Send drawing mode status over Serial1 (UART)
+        Serial1.println(DRAWING_MODE_BYTE);  // Send drawing mode status over Serial1 (UART)
     }
     drawMode = true;
 }
 
 void sendDrawBufferToUART() {
-    if (readyToDrawBuffer) {
-        uint8_t buffer[bytesToDrawInCurrentBlock + 1];  // +1 for null terminator
+    uint8_t buffer[bytesToDrawInCurrentBlock + 1];  // +1 for null terminator
 
-        for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
-            for (uint8_t index = 0; index < bytesToDrawInCurrentBlock; index++) {
-                buffer[index] = ((drawingBuffer[index] >> bitIndex) & 1) ? '.' : ' ';
-            }
-            buffer[bytesToDrawInCurrentBlock] = '\n';                           // Null-terminate the buffer to safely print as a string
-            Serial.println("Sending drawing buffer to UART:");                  // Log the action of sending the drawing buffer
-            uart_write_blocking(uart0, buffer, bytesToDrawInCurrentBlock + 1);  // Send each byte of the drawing buffer over Serial1 (UART)
+    Serial.println("Sending drawing buffer to UART:");  // Log the action of sending the drawing buffer
+    for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
+        for (uint8_t index = 0; index < bytesToDrawInCurrentBlock; index++) {
+            uint8_t mask = 1 << bitIndex;
+            buffer[index] = (drawingBuffer[index] & mask) ? '.' : ' ';
         }
+        buffer[bytesToDrawInCurrentBlock] = '\n';                           // Null-terminate the buffer to safely print as a string
+        uart_write_blocking(uart0, buffer, bytesToDrawInCurrentBlock + 1);  // Send each byte of the drawing buffer over Serial1 (UART)
     }
+
+    bytesToDrawInCurrentBlock = 0;
+    Serial.println("Finished drawing block.");
 }
 
 void processDrawingByte(uint_fast8_t dataByte) {
-    static uint8_t drawingBlock = 0;
     static uint8_t drawingByteNumber = 0;
 
-    if (bytesToDrawInCurrentBlock == 0) {
+    if (bytesToDrawInCurrentBlock == 0) {  // If this is the first byte of a new drawing block, we will treat it as the byte count for how many bytes of drawing data to expect for this block, which allows for variable width drawing blocks up to the maximum defined by MAX_DRAWING_BYTES_PER_BLOCK.
         bytesToDrawInCurrentBlock = dataByte;
         Serial.print("Receiver will wait ");
         Serial.print(bytesToDrawInCurrentBlock);
@@ -255,14 +252,12 @@ void processDrawingByte(uint_fast8_t dataByte) {
         return;
     }
 
-    Serial.print("Drawing byte number: ");
-    Serial.println(drawingByteNumber);
-
     drawingBuffer[drawingByteNumber++] = dataByte;
 
-    if (drawingByteNumber == bytesToDrawInCurrentBlock) {
+    if (drawingByteNumber >= bytesToDrawInCurrentBlock) {
         readyToDrawBuffer = true;
         drawingByteNumber = 0;
+        drawingBlock++;
         Serial.println("Ready to draw buffer.");
     }
 }
@@ -284,9 +279,15 @@ void processReceivedByte(uint8_t bufferToRead) {
 
     uint_fast8_t errorCorrectionBits = extractErrorCorrectionBits(buffer);  // only 4 bits used
     uint_fast8_t dataByte = extractDataByte(buffer);
+
+    if (dataByte == 255) {
+        Serial.println("Data byte error detected. Discarding byte.");
+        return;
+    }
+
     uint_fast8_t calculateErrorCorrectionBits = calculateErrorCorrection(dataByte);  // Check error correction for the decoded byte;
 
-    if (errorCorrectionBits != -1 && errorCorrectionBits != calculateErrorCorrectionBits) {
+    if (errorCorrectionBits != 255 && errorCorrectionBits != calculateErrorCorrectionBits) {
         // TODO: In case of error correction mismatch, we could attempt to correct the data by flipping bits and checking if the error correction matches. For now, we will just discard the byte if there is an error correction mismatch.
         Serial.println("Error correction mismatch detected. Ignoring for now.");
     }
@@ -294,6 +295,11 @@ void processReceivedByte(uint8_t bufferToRead) {
     switch (dataByte) {
         case END_OF_TRANSMISSION_BYTE:
             Serial1.println();  // Send a newline to indicate end of transmission
+            terminationByteReceived = true;
+            if (drawingBlock >= DRAWING_BLOCKS) {
+                drawingBlock = 0;  // Reset drawing block count for the next set of drawing data
+                drawMode = false;  // Reset drawing mode for the next transmission
+            }
             break;
         case DRAWING_MODE_BYTE:
             enableDrawingMode();  // Enable drawing mode and pass the previous data byte for context
@@ -302,7 +308,7 @@ void processReceivedByte(uint8_t bufferToRead) {
             if (drawMode) {
                 processDrawingByte(dataByte);
             } else {
-                printDataByte(dataByte);
+                sendSymbolDataByte(dataByte);
             }
             break;
     }
@@ -310,15 +316,7 @@ void processReceivedByte(uint8_t bufferToRead) {
     Serial.println("--------------------------------");
 }
 
-void setup() {
-    Serial.begin(115200);
-    Serial1.begin(115200);
-
-    pinMode(DATA_PIN, INPUT_PULLUP);
-    pinMode(HALF_BIT_RECEIVED_PIN, OUTPUT);
-
-    digitalWriteFast(HALF_BIT_RECEIVED_PIN, LOW);
-
+void setupPWM_ISR() {
     gpio_set_irq_enabled_with_callback(DATA_PIN, GPIO_IRQ_EDGE_FALL, true, &dataISR);
 
     sliceNum = pwm_gpio_to_slice_num(PWM_IRQ_PIN);
@@ -334,19 +332,29 @@ void setup() {
     pwm_init(sliceNum, &config, false);
 }
 
+void setup() {
+    Serial.begin(115200);
+    Serial1.begin(115200);
+
+    pinMode(DATA_PIN, INPUT_PULLUP);
+    pinMode(HALF_BIT_RECEIVED_PIN, OUTPUT);
+
+    digitalWriteFast(HALF_BIT_RECEIVED_PIN, LOW);
+
+    setupPWM_ISR();
+}
+
 void loop() {
     if (byteReadyForProcessing) {
-        byteReadyForProcessing = false;  // Reset the flag to prevent re-processing the same byte
+        byteReadyForProcessing = false;
 
         uint8_t bufferToRead = 1 - activeBuffer;
         processReceivedByte(bufferToRead);
     }
 
-    if (readyToDrawBuffer) {
-        sendDrawBufferToUART();
-
+    if (readyToDrawBuffer && terminationByteReceived) {
         readyToDrawBuffer = false;
-        bytesToDrawInCurrentBlock = 0;
-        Serial.println("Finished drawing block.");
+        terminationByteReceived = false;
+        sendDrawBufferToUART();
     }
 }
