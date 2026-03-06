@@ -63,7 +63,6 @@ uint sliceNum;
 
 bool drawMode = false;
 bool readyToDrawBuffer = false;
-uint8_t drawingBlock = 0;
 bool terminationByteReceived = false;
 uint8_t drawingBuffer[MAX_DRAWING_BYTES_PER_BLOCK];
 uint8_t bytesToDrawInCurrentBlock = 0;
@@ -243,6 +242,7 @@ void sendDrawBufferToUART() {
 
 void processDrawingByte(uint_fast8_t dataByte) {
     static uint8_t drawingByteNumber = 0;
+    static uint8_t drawingBlock = 0;
 
     if (bytesToDrawInCurrentBlock == 0) {  // If this is the first byte of a new drawing block, we will treat it as the byte count for how many bytes of drawing data to expect for this block, which allows for variable width drawing blocks up to the maximum defined by MAX_DRAWING_BYTES_PER_BLOCK.
         bytesToDrawInCurrentBlock = dataByte;
@@ -259,6 +259,11 @@ void processDrawingByte(uint_fast8_t dataByte) {
         drawingByteNumber = 0;
         drawingBlock++;
         Serial.println("Ready to draw buffer.");
+    }
+
+    if (drawingBlock >= DRAWING_BLOCKS) {
+        drawingBlock = 0;  // Reset drawing block count for the next set of drawing data
+        disableDrawingMode();
     }
 }
 
@@ -296,10 +301,6 @@ void processReceivedByte(uint8_t bufferToRead) {
         case END_OF_TRANSMISSION_BYTE:
             Serial1.println();  // Send a newline to indicate end of transmission
             terminationByteReceived = true;
-            if (drawingBlock >= DRAWING_BLOCKS) {
-                drawingBlock = 0;  // Reset drawing block count for the next set of drawing data
-                drawMode = false;  // Reset drawing mode for the next transmission
-            }
             break;
         case DRAWING_MODE_BYTE:
             enableDrawingMode();  // Enable drawing mode and pass the previous data byte for context
