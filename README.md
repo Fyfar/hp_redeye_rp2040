@@ -81,9 +81,7 @@ This project is provided **as-is**, without any warranty.
 - Timing accuracy may depend on clock configuration and firmware settings.
 - There is no guarantee of compatibility with all RedEye devices.
 - You are responsible for verifying electrical compatibility before connecting hardware.
-- Improper wiring may damage your RP2040 board or calculator.
-
-Use at your own risk.
+- Improper wiring may damage your RP2040 board or IR module.
 
 ---
 
@@ -91,6 +89,7 @@ Use at your own risk.
 
 Many classic HP calculators use the RedEye IR protocol, but modern computers do not natively support it.  
 This project bridges that gap by converting legacy IR communication into a simple UART stream that can be easily captured and analyzed.
+I also implemented graphics mode, so you could "print" the whole LCD and transfer using UART.
 
 ---
 
