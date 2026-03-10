@@ -65,6 +65,13 @@ The UART output contains decoded RedEye payload bytes in real time.
 
 ---
 
+## Examples
+
+Print LCD pixel-by-pixel (char 27 is DRAW mode pointer): ![Image alt](https://github.com/Fyfar/hp_redeye_rp2040/raw/main/prlcd.png)
+Print RPN stack and single value as value: ![Image alt](https://github.com/Fyfar/hp_redeye_rp2040/raw/main/print%20stack.png)
+
+---
+
 ## Project Status
 
 This is a **hobbyist project** created for experimentation and personal use.
