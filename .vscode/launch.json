@@ -12,11 +12,9 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",
-            "executable": "/Users/fyfar/projects/esp32/hp_redeye_protocol/.pio/build/pico/firmware.elf",
+            "executable": "${workspaceFolder}/.pio/build/pico/firmware.elf",
             "projectEnvName": "pico",
-            "toolchainBinDir": "/Users/fyfar/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "/Users/fyfar/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
             "preLaunchTask": {
                 "type": "PlatformIO",
                 "task": "Pre-Debug"
@@ -26,21 +24,17 @@
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (skip Pre-Debug)",
-            "executable": "/Users/fyfar/projects/esp32/hp_redeye_protocol/.pio/build/pico/firmware.elf",
+            "executable": "${workspaceFolder}/.pio/build/pico/firmware.elf",
             "projectEnvName": "pico",
-            "toolchainBinDir": "/Users/fyfar/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
-            "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "/Users/fyfar/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd"
+            "internalConsoleOptions": "openOnSessionStart"
         },
         {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug (without uploading)",
-            "executable": "/Users/fyfar/projects/esp32/hp_redeye_protocol/.pio/build/pico/firmware.elf",
+            "executable": "${workspaceFolder}/.pio/build/pico/firmware.elf",
             "projectEnvName": "pico",
-            "toolchainBinDir": "/Users/fyfar/.platformio/packages/toolchain-rp2040-earlephilhower/bin",
             "internalConsoleOptions": "openOnSessionStart",
-            "svdPath": "/Users/fyfar/.platformio/platforms/raspberrypi@src-ff76a3915224135aafad379817f41edd/misc/svd/rp2040.svd",
             "loadMode": "manual"
         }
     ]

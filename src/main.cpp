@@ -1,5 +1,5 @@
 #define DATA_PIN 2
-#define HALF_BIT_RECEIVED_PIN 4
+#define HALF_BIT_RECEIVED_PIN 3
 #define HALF_BIT_INTERVAL_US 419
 #define MAX_HALF_BITS 30
 #define PWM_IRQ_PIN 15  // any existing pin
