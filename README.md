@@ -35,13 +35,16 @@ This effectively converts HP RedEye IR communication into a standard UART data s
 
 ### Connections (Typical)
 
-- TSMP58000 OUT → RP2040 GPIO (configurable)
-- TSMP58000 VCC → 3.3V
-- TSMP58000 GND → GND
-- RP2040 UART0 TX → External UART device RX
-- RP2040 GND → Common ground
+| Signal | Pin | Notes |
+|---|---|---|
+| TSMP58000 OUT | GPIO 2 (`DATA_PIN`) | IR signal input |
+| TSMP58000 VCC | 3.3V | |
+| TSMP58000 GND | GND | |
+| UART0 TX | GPIO 0 | 115200 baud, connect to RX of target device |
+| GND | GND | Common ground with target device |
+| GPIO 3 (`HALF_BIT_RECEIVED_PIN`) | optional | Debug probe — toggles on each half-bit, useful with a logic analyzer |
 
-Pin assignments can be changed in firmware if needed.
+Pin assignments can be changed by editing the `#define` constants at the top of `src/main.cpp`.
 
 ---
 
@@ -67,8 +70,27 @@ The UART output contains decoded RedEye payload bytes in real time.
 
 ## Examples
 
-Print LCD pixel-by-pixel (char 27 is DRAW mode pointer): ![Image alt](https://github.com/Fyfar/hp_redeye_rp2040/raw/main/prlcd.png)
-Print RPN stack and single value as value: ![Image alt](https://github.com/Fyfar/hp_redeye_rp2040/raw/main/print%20stack.png)
+Print LCD pixel-by-pixel (byte 27 triggers drawing mode):
+![HP 28C LCD printed pixel-by-pixel via RedEye drawing mode](https://github.com/Fyfar/HP_RedEye/raw/main/prlcd.png)
+
+Print RPN stack and a single numeric value:
+![HP 28C RPN stack printed as text via RedEye](https://github.com/Fyfar/HP_RedEye/raw/main/print%20stack.png)
+
+---
+
+## Building & Flashing
+
+Requires [PlatformIO](https://platformio.org) (e.g. via the VS Code extension or CLI).
+
+```bash
+# Build and upload
+pio run --target upload
+
+# Open serial monitor (115200 baud)
+pio device monitor
+```
+
+The USB serial port (`Serial`) outputs debug info. `Serial1` (UART0, GPIO 0) outputs the decoded bytes.
 
 ---
 
