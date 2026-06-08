@@ -4,17 +4,19 @@
 #define MAX_HALF_BITS 30
 #define PWM_IRQ_PIN 15  // any existing pin
 
+// HP RedEye error correction parity masks — each covers a subset of the 8 data bits;
+// a transmitted EC bit is set if the count of 1s under that mask is odd.
 #define EC_MASK1 0b01111000
 #define EC_MASK2 0b11100110
 #define EC_MASK3 0b11010101
 #define EC_MASK4 0b10001011
 
-#define DRAWING_MODE_BYTE 27
+#define DRAWING_MODE_BYTE 27             // ASCII ESC (0x1B)
 #define DRAWING_BLOCKS 4                 // LCD is 32 pixels height, and each block is 8 pixels (1 byte), so we need 4 blocks to represent the full height of the LCD
 #define MAX_DRAWING_BYTES_PER_BLOCK 166  // represents max line width of HP 82240A/B printer
 
-#define END_OF_TRANSMISSION_BYTE 4
-#define ASCII_OFFSET 128
+#define END_OF_TRANSMISSION_BYTE 4  // ASCII EOT (0x04)
+#define ASCII_OFFSET 128            // HP Roman-8 extended characters start at byte value 128
 
 #include <Arduino.h>
 #include <hardware/pwm.h>
@@ -105,9 +107,9 @@ void __no_inline_not_in_flash_func(dataISR)(uint gpio, uint32_t events) {
 }
 
 uint_fast8_t checkBit(const bool firstHalfBit, const bool secondHalfBit) {
-    if (firstHalfBit == 0 && secondHalfBit == 1) {
+    if (!firstHalfBit && secondHalfBit) {
         return 0;  // Logical '0'
-    } else if (firstHalfBit == 1 && secondHalfBit == 0) {
+    } else if (firstHalfBit && !secondHalfBit) {
         return 1;  // Logical '1'
     } else {
         return 255;  // Invalid bit (error)
@@ -116,7 +118,6 @@ uint_fast8_t checkBit(const bool firstHalfBit, const bool secondHalfBit) {
 
 bool validateStartHalfBits(const bool* buffer) {
     for (uint8_t i = protocolConfig.startHalfBitsOffset; i < protocolConfig.startHalfBits; i++) {
-        uint8_t bitPosition = protocolConfig.startHalfBits - 1 - i;
         if (!buffer[i]) return false;  // Start half-bits should be all 1s, if not, it's an error
     }
 
@@ -142,8 +143,8 @@ uint_fast8_t extractErrorCorrectionBits(const bool* buffer) {
             return 255;  // Return 255 to indicate an error in error correction bits
         }
 
-        uint8_t bitPosition = (i - 3) / 2;                       // Calculate bit position for error correction
-        errorCorrectionBits |= (bitValue << (3 - bitPosition));  // Shift and combine bits into errorCorrection variable
+        uint8_t bitPosition = (i - protocolConfig.errorCheckingBitsOffset) / 2;
+        errorCorrectionBits |= (bitValue << (3 - bitPosition));
     }
 
     Serial.print("Error correction value: 0b");
@@ -173,26 +174,12 @@ uint_fast8_t extractDataByte(const bool* buffer) {
 
         if (bitValue == 255) return 255;  // Return 255 to indicate an error in data bits
 
-        uint8_t bitPosition = (i - 11) / 2;           // Calculate bit position for data bits
-        dataByte |= (bitValue << (7 - bitPosition));  // Shift and combine bits into a byte
+        uint8_t bitPosition = (i - protocolConfig.dataBitsOffset) / 2;
+        dataByte |= (bitValue << (7 - bitPosition));
     }
 
     Serial.print("Decoded byte: 0b");
     Serial.println(dataByte, BIN);
-
-    if (drawMode) {
-        return dataByte;  // If we are in drawing mode, we will return the raw byte value for processing as drawing data, without interpreting it as ASCII or Roman symbols, since the drawing data can contain any byte value and is not meant to be interpreted as text.
-    }
-
-    if (dataByte >= ASCII_OFFSET + 18) {
-        Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS.");
-    } else if (dataByte >= ASCII_OFFSET && dataByte < ASCII_OFFSET + 18) {
-        Serial.print("Decoded byte (roman symbol): ");
-        Serial.println(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);
-    } else {
-        Serial.print("Decoded byte (ascii): ");
-        Serial.println((char)dataByte);
-    }
 
     return dataByte;
 }
@@ -209,8 +196,8 @@ void sendSymbolDataByte(uint_fast8_t dataByte) {
 
 void disableDrawingMode() {
     if (drawMode) {
-        Serial.println("Drawing mode OFF");  // Send drawing mode status over Serial (USB)
-        Serial1.println(DRAWING_MODE_BYTE);  // Send drawing mode status over Serial1 (
+        Serial.println("Drawing mode OFF");
+        Serial1.println(DRAWING_MODE_BYTE);
     }
     drawMode = false;
 }
@@ -224,16 +211,16 @@ void enableDrawingMode() {
 }
 
 void sendDrawBufferToUART() {
-    uint8_t buffer[bytesToDrawInCurrentBlock + 1];  // +1 for null terminator
+    uint8_t buffer[MAX_DRAWING_BYTES_PER_BLOCK + 1];  // +1 for trailing newline
 
-    Serial.println("Sending drawing buffer to UART:");  // Log the action of sending the drawing buffer
+    Serial.println("Sending drawing buffer to UART:");
     for (uint8_t bitIndex = 0; bitIndex < 8; bitIndex++) {
         for (uint8_t index = 0; index < bytesToDrawInCurrentBlock; index++) {
             uint8_t mask = 1 << bitIndex;
             buffer[index] = (drawingBuffer[index] & mask) ? '.' : ' ';
         }
-        buffer[bytesToDrawInCurrentBlock] = '\n';                           // Null-terminate the buffer to safely print as a string
-        uart_write_blocking(uart0, buffer, bytesToDrawInCurrentBlock + 1);  // Send each byte of the drawing buffer over Serial1 (UART)
+        buffer[bytesToDrawInCurrentBlock] = '\n';
+        uart_write_blocking(uart0, buffer, bytesToDrawInCurrentBlock + 1);
     }
 
     bytesToDrawInCurrentBlock = 0;
@@ -288,6 +275,18 @@ void processReceivedByte(uint8_t bufferToRead) {
     if (dataByte == 255) {
         Serial.println("Data byte error detected. Discarding byte.");
         return;
+    }
+
+    if (!drawMode) {
+        if (dataByte >= ASCII_OFFSET + 18) {
+            Serial.println("Decoded byte is out of bounds for defined ROMAN_8_SYMBOLS.");
+        } else if (dataByte >= ASCII_OFFSET && dataByte < ASCII_OFFSET + 18) {
+            Serial.print("Decoded byte (roman symbol): ");
+            Serial.println(ROMAN_8_SYMBOLS[dataByte - ASCII_OFFSET]);
+        } else {
+            Serial.print("Decoded byte (ascii): ");
+            Serial.println((char)dataByte);
+        }
     }
 
     uint_fast8_t calculateErrorCorrectionBits = calculateErrorCorrection(dataByte);  // Check error correction for the decoded byte;
